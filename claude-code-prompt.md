@@ -1134,8 +1134,20 @@ Before writing any code, produce:
 - Directory layout (tree format) — must include `app/ingestion/` module
   structure as specified above
 - Exact Python and JS dependencies with versions
-- Build order (what you'll do in each phase)
+- Build order structured as two milestones (see below)
 - Any decisions that differ from this brief and why
+
+**Build order — two milestones:**
+
+**Milestone A — Ingestion complete (Phases 1 → 2 → 3a → 3b → 3c)**
+Goal: all SEC filing data is fetched, parsed, chunked, embedded, and
+summarized into Postgres. Queryable via raw SQL. No Claude, no chat, no
+frontend.
+
+**Milestone B — RAG + Chat (Phases 4 → 5 → 6)**
+Goal: Claude tools, streaming chat UI, polish.
+**Do not start Milestone B until the Milestone A data gate passes** (see
+checkpoint below).
 
 **Stop and wait for my confirmation before proceeding.**
 
@@ -1231,6 +1243,67 @@ Before writing any code, produce:
   4. Document status is 'indexed'
 
 **Stop. Tell me what to verify and what's next.**
+
+---
+
+### ✅ MILESTONE A GATE — Ingestion complete
+
+Before writing any Phase 4 code, run these SQL checks and show me all
+results. Do not proceed to Phase 4 until every check passes.
+
+```sql
+-- 1. Row counts across all ingestion tables
+SELECT
+  (SELECT COUNT(*) FROM companies)              AS companies,
+  (SELECT COUNT(*) FROM documents)              AS documents,
+  (SELECT COUNT(*) FROM financial_line_items)   AS line_items,
+  (SELECT COUNT(*) FROM document_chunks)        AS chunks,
+  (SELECT COUNT(*) FROM section_summaries)      AS section_summaries,
+  (SELECT COUNT(*) FROM document_summaries)     AS doc_summaries;
+
+-- 2. All documents are fully indexed (none stuck mid-pipeline)
+SELECT status, COUNT(*) FROM documents GROUP BY status;
+-- Expected: only 'indexed' rows. No 'fetched' or 'parsed' or 'normalized'.
+
+-- 3. Sample financial data (Level 4)
+SELECT line_item, period_end, period_type, value
+FROM financial_line_items
+WHERE company_id = 1 AND line_item = 'revenue'
+ORDER BY period_end DESC LIMIT 5;
+
+-- 4. Sample chunk with embedding dimension (Level 3)
+SELECT chunk_id, section_title, token_count,
+       array_length(embedding::text::text[], 1) AS embedding_dims,
+       LEFT(text, 100) AS text_preview
+FROM document_chunks LIMIT 3;
+-- embedding_dims must be 384
+
+-- 5. Sample vector similarity search (confirms pgvector is working)
+SELECT chunk_id, section_title,
+       embedding <=> (SELECT embedding FROM document_chunks LIMIT 1) AS dist
+FROM document_chunks
+ORDER BY dist LIMIT 5;
+
+-- 6. Sample section summary (Level 2)
+SELECT section_title, LEFT(summary_text, 150) AS summary_preview
+FROM section_summaries
+WHERE document_id = (SELECT document_id FROM documents WHERE status='indexed' LIMIT 1);
+
+-- 7. Document summary + key_themes (Level 1)
+SELECT LEFT(summary_text, 200) AS summary_preview, key_themes
+FROM document_summaries LIMIT 3;
+```
+
+**Gate criteria — all must be true before Milestone B starts:**
+- [ ] `chunks` > 0 and `doc_summaries` > 0
+- [ ] No documents with status other than 'indexed'
+- [ ] `embedding_dims` = 384
+- [ ] Vector search returns rows without error
+- [ ] `key_themes` array is non-empty on at least one document summary
+
+**Stop. Show me all query results. I will confirm before Phase 4 starts.**
+
+---
 
 ### Phase 4 — Tools + Claude loop (CLI chat)
 - Implement all 5 tools with Pydantic input/output models
