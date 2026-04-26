@@ -1,0 +1,29 @@
+companies:
+  - ticker: AAPL
+    name: Apple Inc.
+    cik: "0000320193"
+    exchange: NASDAQ
+    sector: Technology
+  - ticker: MSFT
+    name: Microsoft Corporation
+    cik: "0000789019"
+    exchange: NASDAQ
+    sector: Technology
+  - ticker: GOOGL
+    name: Alphabet Inc.
+    cik: "0001652044"
+    exchange: NASDAQ
+    sector: Technology
+
+ingestion:
+  since: "2022-01-01"
+  embedding_model: "all-MiniLM-L6-v2"
+  summary_method: "extractive"   # "extractive" | "llm"
+
+chunking:
+  target_tokens: 800
+  overlap_tokens: 100
+
+retrieval:
+  distance_threshold: 0.5
+  max_results_per_tool: 5

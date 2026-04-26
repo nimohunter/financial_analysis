@@ -44,11 +44,14 @@ postgres-data/
 .DS_Store
 Thumbs.db
 
+# Raw fetched data (EDGAR JSON + HTML) — not committed
+data/
+
 # Logs
 *.log
 logs/
 
-# Model cache (sentence-transformers downloads here)
+# Model cache (fastembed/ONNX model downloads)
 .cache/
 ~/.cache/
 

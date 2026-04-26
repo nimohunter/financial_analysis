@@ -53,11 +53,15 @@ but document why in the README):
 
 - **Backend**: Python 3.12 + FastAPI
 - **Database**: Postgres 16 + pgvector extension
-- **Embeddings**: sentence-transformers `all-MiniLM-L6-v2` (384 dimensions)
-- **LLM for summaries**: Claude Haiku (claude-haiku-4-5-20241022) via the
-  Anthropic SDK — used only during ingestion, not in the chat path
+- **Embeddings**: `fastembed` with `all-MiniLM-L6-v2` (384 dimensions, ONNX
+  backend — no torch required, ~100 MB install)
+- **LLM for summaries**: Groq API, model `qwen/qwen3-32b` — used only during
+  ingestion (Phase 3c), not in the chat path. Fast and cheap. Disable
+  thinking mode (`reasoning_effort="none"`) for summary tasks.
 - **Chat model**: Claude Sonnet (claude-sonnet-4-5-20241022) via Anthropic
   SDK with tool_use
+- **PDF parsing**: `pymupdf` (PyMuPDF) — for user-uploaded PDFs. Fast
+  extraction with font-size metadata for heading detection.
 - **Frontend**: Minimal React (Vite) or plain HTML+JS — whichever is faster
   to get running. No auth needed.
 - **Containerization**: docker-compose.yml with postgres and backend.
@@ -87,7 +91,7 @@ companies (
 documents (
     document_id  SERIAL PRIMARY KEY,
     company_id   INT REFERENCES companies(company_id),
-    doc_type     VARCHAR(10) NOT NULL,     -- '10-K', '10-Q'
+    doc_type     VARCHAR(30) NOT NULL,     -- '10-K', '10-Q', 'UPLOAD'
     period_end   DATE NOT NULL,
     filed_at     TIMESTAMPTZ,
     source_url   TEXT,
@@ -234,6 +238,8 @@ app/ingestion/
     chunker.py          # Step 5: sections → chunks
     embedder.py         # Step 6: text → vectors
     summarizer.py       # Step 7: generate section + doc summaries
+    parser_pdf.py       # PDF text extraction + heading detection (uploads)
+    fetcher_upload.py   # Save uploaded file, dedup, insert documents row
     pipeline.py         # Orchestrator: runs steps in order per company
     cli.py              # CLI entry point
 ```
@@ -682,8 +688,13 @@ table).
 memory across all documents. Do NOT reload per document.
 
 ```python
-from sentence_transformers import SentenceTransformer
-model = SentenceTransformer("all-MiniLM-L6-v2")
+from fastembed import TextEmbedding
+model = TextEmbedding("sentence-transformers/all-MiniLM-L6-v2")
+```
+
+Install fastembed via pip (poetry can't resolve it on Python 3.9):
+```bash
+pip install fastembed==0.3.6
 ```
 
 **Context-enriched embedding input**: The text stored in the `text` column
@@ -703,7 +714,7 @@ Store BOTH in the database:
 **Batch embedding**: Embed all chunks for a document in one batch:
 ```python
 embedding_inputs = [build_embedding_input(c, company, doc_type) for c in chunks]
-vectors = model.encode(embedding_inputs, batch_size=32, show_progress_bar=False)
+vectors = list(model.embed(embedding_inputs))  # fastembed returns a generator
 ```
 
 **Insert**: Batch insert into `document_chunks`. Use executemany or COPY
@@ -733,11 +744,16 @@ def extractive_summary(section_text: str, max_sentences: int = 3) -> str:
     return " ".join(sentences)
 ```
 
-**Phase 2 approach — LLM-generated summary** (better quality, costs ~$0.001 per section):
+**Phase 2 approach — LLM-generated summary** (better quality):
 ```python
-response = anthropic_client.messages.create(
-    model="claude-haiku-4-5-20241022",
+from groq import Groq
+
+groq_client = Groq(api_key=os.environ["GROQ_API_KEY"])
+
+response = groq_client.chat.completions.create(
+    model="qwen/qwen3-32b",
     max_tokens=200,
+    reasoning_effort="none",  # disable thinking for speed/cost
     messages=[{
         "role": "user",
         "content": f"""Summarize this section from {company_name}'s {doc_type}
@@ -751,7 +767,7 @@ Text (first 6000 chars):
 {section_text[:6000]}"""
     }]
 )
-summary_text = response.content[0].text
+summary_text = response.choices[0].message.content
 ```
 
 **Start with extractive (Phase 1). Switch to LLM (Phase 2) when retrieval
@@ -783,14 +799,19 @@ summaries as input.
 
 **Implementation**:
 ```python
+from groq import Groq
+
+groq_client = Groq(api_key=os.environ["GROQ_API_KEY"])
+
 section_texts = "\n".join(
     f"- {s.section_title}: {s.summary_text}"
     for s in section_summaries
 )
 
-response = anthropic_client.messages.create(
-    model="claude-haiku-4-5-20241022",
+response = groq_client.chat.completions.create(
+    model="qwen/qwen3-32b",
     max_tokens=300,
+    reasoning_effort="none",  # disable thinking
     messages=[{
         "role": "user",
         "content": f"""Here are section summaries from {company_name}'s
@@ -809,7 +830,7 @@ Example: THEMES: ["supply_chain_risk", "revenue_growth", "regulatory_pressure"]"
 )
 
 # Parse summary text and themes from response
-raw = response.content[0].text
+raw = response.choices[0].message.content
 if "THEMES:" in raw:
     summary_text = raw[:raw.index("THEMES:")].strip()
     themes_str = raw[raw.index("THEMES:") + 7:].strip()
@@ -1078,7 +1099,12 @@ Minimal chat interface:
 
 ### Environment variables (.env.example)
 ```
+# Chat backend (Phase 4+)
 ANTHROPIC_API_KEY=sk-ant-...
+
+# Ingestion summarizer (Phase 3c)
+GROQ_API_KEY=gsk_...
+
 SEC_USER_AGENT_EMAIL=your_email@example.com
 DATABASE_URL=postgresql://finagent:password@postgres:5432/finagent
 READONLY_DATABASE_URL=postgresql://readonly:password@postgres:5432/finagent
@@ -1133,7 +1159,7 @@ Include:
 Before writing any code, produce:
 - Directory layout (tree format) — must include `app/ingestion/` module
   structure as specified above
-- Exact Python and JS dependencies with versions
+- Exact Python and JS dependencies with versions, python need use venv.
 - Build order structured as two milestones (see below)
 - Any decisions that differ from this brief and why
 
@@ -1246,6 +1272,224 @@ checkpoint below).
 
 ---
 
+### Phase 3d — PDF / document upload
+
+Allow users to upload arbitrary PDFs (analyst reports, research notes,
+custom documents) via a `POST /upload` HTTP endpoint. Uploaded documents
+run through the same chunker → embedder → summarizer pipeline as HTML
+filings but skip Level 4 (no XBRL data in PDFs).
+
+#### Four-level behaviour for uploaded docs
+
+| Level | Table | Behaviour |
+|-------|-------|-----------|
+| 1 | `document_summaries` | ✅ Claude Haiku summarizes whole doc |
+| 2 | `section_summaries` | ✅ Best-effort — headings detected by font size |
+| 3 | `document_chunks` | ✅ Full text chunked + embedded |
+| 4 | `financial_line_items` | ❌ Skipped — no XBRL |
+
+#### New modules
+
+**`parser_pdf.py`** — PDF text extraction using `pymupdf` (fitz):
+
+```python
+import fitz  # pymupdf
+
+@dataclass
+class Section:
+    title: str
+    text: str
+
+def extract_sections(pdf_bytes: bytes, label: str = "UPLOADED DOCUMENT") -> list[Section]:
+    """
+    Extract clean text from a PDF and split into sections by heading heuristic.
+
+    Heading detection: a line is treated as a heading if its font size is
+    >= 1.2x the median body font size AND the line is < 120 characters.
+    Fallback: if fewer than 2 headings detected, treat the whole doc as
+    one section titled by `label`.
+    """
+    doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+    blocks_by_size: list[tuple[float, str]] = []
+
+    for page in doc:
+        for block in page.get_text("dict")["blocks"]:
+            if block["type"] != 0:  # 0 = text block
+                continue
+            for line in block["lines"]:
+                for span in line["spans"]:
+                    blocks_by_size.append((span["size"], span["text"].strip()))
+
+    if not blocks_by_size:
+        return [Section(title=label, text="")]
+
+    sizes = sorted(s for s, _ in blocks_by_size)
+    median_size = sizes[len(sizes) // 2]
+    heading_threshold = median_size * 1.2
+
+    sections: list[Section] = []
+    current_title = label
+    current_lines: list[str] = []
+
+    for size, text in blocks_by_size:
+        if not text:
+            continue
+        if size >= heading_threshold and len(text) < 120:
+            # Flush previous section
+            if current_lines:
+                sections.append(Section(title=current_title, text="\n".join(current_lines)))
+            current_title = text
+            current_lines = []
+        else:
+            current_lines.append(text)
+
+    if current_lines:
+        sections.append(Section(title=current_title, text="\n".join(current_lines)))
+
+    # Fallback: no heading structure detected
+    if len(sections) <= 1:
+        full_text = "\n".join(t for _, t in blocks_by_size if t)
+        return [Section(title=label, text=full_text)]
+
+    return sections
+```
+
+**`fetcher_upload.py`** — save file to `data/uploads/`, dedup by sha256:
+
+```python
+import hashlib
+from pathlib import Path
+from datetime import date as date_type
+from sqlalchemy.orm import Session
+from app.models import Company, Document
+
+UPLOAD_DIR = Path("data/uploads")
+
+def save_upload(
+    file_bytes: bytes,
+    filename: str,
+    company: Company,
+    period_end: date_type,
+    session: Session,
+) -> Document | None:
+    """
+    Persist uploaded file and insert a documents row.
+    Returns None if duplicate (same hash already in DB).
+    """
+    UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
+    raw_hash = hashlib.sha256(file_bytes).hexdigest()
+
+    if session.query(Document).filter_by(raw_hash=raw_hash).first():
+        return None  # duplicate
+
+    dest = UPLOAD_DIR / f"{raw_hash[:16]}_{filename}"
+    dest.write_bytes(file_bytes)
+
+    doc = Document(
+        company_id=company.company_id,
+        doc_type="UPLOAD",
+        period_end=period_end,
+        source_url=str(dest),
+        raw_hash=raw_hash,
+        status="fetched",
+    )
+    session.add(doc)
+    session.flush()
+    return doc
+```
+
+#### Upload endpoint (`app/main.py` or a new `app/ingestion/router_upload.py`)
+
+Add a router with a single endpoint:
+
+```python
+POST /upload
+Content-Type: multipart/form-data
+
+Fields:
+  file       UploadFile   required  PDF file (application/pdf)
+  ticker     str          required  Which company this doc belongs to
+  label      str          optional  Human-readable name (shown in citations)
+  period_end date         optional  Defaults to today
+```
+
+Synchronous processing (run pipeline inline, return when done):
+
+```python
+@router.post("/upload")
+async def upload_document(
+    file: UploadFile,
+    ticker: str = Form(...),
+    label: str = Form(""),
+    period_end: date | None = Form(None),
+    session: Session = Depends(get_session),
+) -> dict:
+    if file.content_type != "application/pdf":
+        raise HTTPException(400, "Only PDF files are supported")
+
+    pdf_bytes = await file.read()
+    company = session.query(Company).filter_by(ticker=ticker.upper()).first()
+    if not company:
+        raise HTTPException(404, f"Ticker {ticker} not found. Run ingestion first.")
+
+    doc_label = label or file.filename or "UPLOADED DOCUMENT"
+    p_end = period_end or date.today()
+
+    doc = fetcher_upload.save_upload(pdf_bytes, file.filename, company, p_end, session)
+    if doc is None:
+        return {"status": "duplicate", "message": "This file has already been ingested."}
+
+    # Reuse existing pipeline steps (chunker, embedder, summarizer)
+    sections = parser_pdf.extract_sections(pdf_bytes, doc_label)
+    doc.status = "parsed"
+    session.commit()
+
+    result = await ingest_document_sections(doc, sections, company, session)
+    return {
+        "status": "indexed",
+        "document_id": doc.document_id,
+        "chunks": result.chunks_inserted,
+        "sections": result.sections_inserted,
+    }
+```
+
+`ingest_document_sections()` is a shared helper in `pipeline.py` that runs
+steps 5-8 (chunk → embed → section summaries → doc summary) given a list
+of `Section` objects and a `Document` row. Both the HTML filing path and the
+upload path call this same helper — no code duplication.
+
+#### `pipeline.py` refactor
+
+Extract the per-document steps (5-8) from `ingest_filings` into a shared
+function:
+
+```python
+async def ingest_document_sections(
+    doc: Document,
+    sections: list[Section],
+    company: Company,
+    session: Session,
+    doc_type_label: str | None = None,
+) -> SectionIngestResult:
+    """
+    Shared steps 5-8: chunk → embed → section summaries → doc summary.
+    Called by both ingest_filings() and the upload endpoint.
+    doc_type_label defaults to doc.doc_type if not provided.
+    """
+    ...
+```
+
+#### Verify (Phase 3d)
+
+1. `POST /upload` with a real PDF (e.g. an analyst report for AAPL) returns `{"status": "indexed", ...}`
+2. `SELECT doc_type, source_url, status FROM documents WHERE doc_type='UPLOAD';` — row present
+3. `SELECT COUNT(*) FROM document_chunks WHERE document_id = <upload_id>;` — chunks > 0
+4. Chat query that should surface content from the uploaded doc returns the upload as a citation source
+
+**Stop. Tell me what to verify and what's next.**
+
+---
+
 ### ✅ MILESTONE A GATE — Ingestion complete
 
 Before writing any Phase 4 code, run these SQL checks and show me all
@@ -1332,10 +1576,13 @@ FROM document_summaries LIMIT 3;
   - Streaming text display
   - Citation markers (inline) that expand on click/hover to show:
     filing type, company, period, section, filed date
+  - Upload panel: file picker (PDF only) + ticker selector + optional label
+    field + submit button. Shows progress and result (indexed / duplicate /
+    error). Uploaded docs appear in the data status list immediately.
 - Data status indicator (last ingestion time)
 - Verify: open browser at localhost:3000 (or wherever), ask "What risks
   did Apple flag in their 2024 10-K?", see streaming response with
-  clickable citations.
+  clickable citations. Also upload a PDF and confirm it becomes queryable.
 
 **Stop. Tell me what to verify and what's next.**
 
