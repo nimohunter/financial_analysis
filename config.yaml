@@ -17,8 +17,9 @@ companies:
 
 ingestion:
   since: "2022-01-01"
-  embedding_model: "all-MiniLM-L6-v2"
-  summary_method: "extractive"   # "extractive" | "llm"
+  # Matches app/ingestion/embedder.py (384-dim); YAML is documentation — embedder loads bge-small directly.
+  embedding_model: "BAAI/bge-small-en-v1.5"
+  summary_method: "extractive"   # "extractive" | "llm" — document summary always uses Groq when GROQ_API_KEY is set
 
 chunking:
   target_tokens: 800

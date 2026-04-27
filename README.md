@@ -115,6 +115,24 @@ curl -X POST http://localhost:8000/upload \
 Uploaded documents go through the same chunking + embedding + summarization
 pipeline as SEC filings. They appear in chat results with `doc_type=UPLOAD`.
 
+Files are stored under `data/uploads/` on the host (bind-mounted as `/app/data/uploads` in Docker).
+
+### PDF extraction today
+
+Ingestion uses **PyMuPDF** with:
+
+- **Reading order** — text from `blocks` / `dict` with MuPDF’s `sort=True`, plus whitespace cleanup (justified layouts, soft hyphens).
+- **Sections** — if the PDF uses clear **numbered major headings** (`1.` / `2.` on their own line or `1. Title` on one line; not `2.1.` subsections), those drive `Section` boundaries. Otherwise a **font-size** heuristic runs; if that still does not split, the document is one section.
+- **Chunking** — `doc_type=UPLOAD` uses the same narrative-style chunking as long SEC sections so long papers are not truncated to a single short chunk.
+
+**Limits:** there is **no OCR** (scanned PDFs may be poor or empty) and no layout model beyond MuPDF. Odd decks, forms, or creative numbering may not section well.
+
+**Docker:** the backend uses `uvicorn --reload --reload-dir /app/app` so writing uploads under `data/` does not restart the server mid-request.
+
+### Optional direction: PDF → Markdown
+
+For more varied PDFs, a common upgrade is an **optional** “PDF → Markdown (or structured JSON) → same chunk/embed pipeline” step (e.g. Docling, Marker), with **fallback** to the current PyMuPDF path on failure or timeout. That is not implemented yet; the bullets above describe the current default.
+
 ---
 
 ## Chat

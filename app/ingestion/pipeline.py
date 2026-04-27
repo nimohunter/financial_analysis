@@ -38,6 +38,12 @@ def seed_companies(session: Session) -> None:
 
 
 @dataclass
+class DocumentIngestStats:
+    chunks_inserted: int
+    sections_count: int
+
+
+@dataclass
 class IngestResult:
     ticker: str
     xbrl_line_items: int = 0
@@ -53,12 +59,11 @@ def ingest_document_sections(
     company: Company,
     session: Session,
     summary_method: str = "extractive",
-) -> int:
+) -> DocumentIngestStats:
     """
     Steps 5-8: chunk → embed → section summaries → doc summary → 'indexed'.
     Idempotent: skips chunk embedding if doc already 'normalized'; always
     regenerates summaries (delete + insert).
-    Returns chunks inserted (0 on resume).
     """
     chunks = chunker.chunk_sections(sections, doc.doc_type)
 
@@ -127,7 +132,7 @@ def ingest_document_sections(
     doc.status = "indexed"
     session.commit()
     logger.info("doc %d → indexed | themes: %s", doc.document_id, themes)
-    return inserted
+    return DocumentIngestStats(chunks_inserted=inserted, sections_count=len(sections))
 
 
 async def ingest_xbrl(company: Company, since: date, session: Session) -> int:
@@ -239,8 +244,8 @@ async def ingest_filings(
             continue
 
         try:
-            n = ingest_document_sections(doc, sections, company, session, summary_method)
-            total_chunks += n
+            stats = ingest_document_sections(doc, sections, company, session, summary_method)
+            total_chunks += stats.chunks_inserted
             fetched += 1
         except Exception:
             logger.exception("%s: embed/summarize failed for %s %s", company.ticker, filing.form, filing.period_end)

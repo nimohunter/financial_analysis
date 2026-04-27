@@ -112,7 +112,8 @@ def chunk_sections(sections: list, doc_type: str = "") -> list[Chunk]:
     index = 0
 
     for section in sections:
-        if section.title in NARRATIVE_SECTIONS:
+        # SEC ITEM titles vs PDF headings — chunk all upload sections as narrative.
+        if doc_type == "UPLOAD" or section.title in NARRATIVE_SECTIONS:
             pairs = _chunk_section_text(section.text, _TARGET_TOKENS, _OVERLAP_TOKENS)
         else:
             truncated = section.text[:_NON_NARRATIVE_CAP_CHARS].strip()

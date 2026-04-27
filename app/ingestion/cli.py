@@ -62,8 +62,13 @@ def main() -> None:
                         help="Ingest all companies in config.yaml")
     parser.add_argument("--since", default="2022-01-01",
                         help="Only ingest filings/facts on or after this date (YYYY-MM-DD)")
-    parser.add_argument("--summary-method", choices=["extractive", "llm"], default="extractive",
-                        help="Section summary strategy (Phase 3c)")
+    parser.add_argument(
+        "--summary-method",
+        choices=["extractive", "llm"],
+        default=None,
+        help="Section summaries: extractive (free) or llm (Groq). "
+        "When omitted, uses ingestion.summary_method from config.yaml (default extractive).",
+    )
     parser.add_argument("--status", action="store_true", help="Show ingestion status and exit")
     args = parser.parse_args()
 
@@ -87,7 +92,15 @@ def main() -> None:
         logger.error("Invalid --since value: %s  (expected YYYY-MM-DD)", args.since)
         sys.exit(1)
 
-    asyncio.run(run_ingest(tickers, since, args.summary_method))
+    raw_method = args.summary_method or (cfg.get("ingestion") or {}).get("summary_method", "extractive")
+    summary_method = str(raw_method).lower().strip()
+    if summary_method not in ("extractive", "llm"):
+        logger.warning("Invalid summary_method %r — using extractive", raw_method)
+        summary_method = "extractive"
+    if args.summary_method is None:
+        logger.info("Using summary_method=%s (from config.yaml)", summary_method)
+
+    asyncio.run(run_ingest(tickers, since, summary_method))
 
 
 if __name__ == "__main__":
