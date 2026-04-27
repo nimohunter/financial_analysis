@@ -154,7 +154,7 @@ docker compose exec backend python -m app.ingest --tickers NVDA --since 2022-01-
 
 | Variable | Required for | Description |
 |----------|-------------|-------------|
-| `ANTHROPIC_API_KEY` | Chat (Phase 4+) | Claude Sonnet for chat |
+| `ANTHROPIC_API_KEY` | Chat backend | Claude Sonnet for chat |
 | `GROQ_API_KEY` | Ingestion summaries | Groq qwen/qwen3-32b for doc summaries |
 | `SEC_USER_AGENT_EMAIL` | Ingestion | Required by SEC EDGAR (any real email) |
 | `DATABASE_URL` | Ingestion | Read-write Postgres URL |
@@ -195,8 +195,57 @@ config.yaml             # Companies + ingestion settings
 
 - Python 3.9+ + FastAPI
 - Postgres 16 + pgvector (384-dim vectors)
-- [fastembed](https://github.com/qdrant/fastembed) with `all-MiniLM-L6-v2` — ONNX, no torch required
+- [fastembed](https://github.com/qdrant/fastembed) with `BAAI/bge-small-en-v1.5` — ONNX, no torch required (384-dim)
 - Groq API (`qwen/qwen3-32b`) for ingestion summaries
-- Claude Sonnet for chat (Anthropic SDK with tool_use)
+- Claude Sonnet (`claude-sonnet-4-6`) for chat (Anthropic SDK with tool_use)
 - React/Vite frontend
 - Docker Compose
+
+---
+
+## Design analysis
+
+### Strengths
+
+- **Four-level retrieval hierarchy** keeps exact financial numbers (XBRL/SQL) separate from narrative passages (vectors). Most RAG systems flatten everything into one vector store; financial Q&A fails when Claude has to parse tables in chunks instead of querying structured data.
+- **Context-enriched embeddings** — every chunk and summary is embedded as `"{company}, {doc_type}, {section_title}: {text}"` rather than raw text. Short texts embed poorly; prepending document context is a known fix that improves retrieval precision.
+- **Extractive summaries by default, LLM upgrade path** — the `--summary-method llm` flag lets you upgrade section summary quality without changing the schema. Free on the first pass, better on the second.
+- **Prompt caching on system prompt + tool definitions** — these tokens are constant across every chat turn. Caching them cuts per-turn cost and latency noticeably on Claude Sonnet.
+
+### Known limitations and mitigations
+
+**1. ~~`all-MiniLM-L6-v2` is a general-purpose model~~ — Fixed.**
+Switched to `BAAI/bge-small-en-v1.5` in `embedder.py`. Same 384-dim output (zero
+schema changes), trained on broader and more domain-diverse corpora. Better
+coverage of financial language ("EBITDA margin", "covenant compliance", "liquidity risk").
+
+**2. Extractive section summaries take the first sentence of every 3rd paragraph.**
+MD&A sections typically bury key numbers mid-section. The first sentence is often
+a backward-looking preamble, not the substance. L2 retrieval (`search_sections`)
+will surface the wrong sections for specific financial queries.
+
+*Recommendation*: Run ingestion with `--summary-method llm` after Phase 3c.
+Groq `qwen/qwen3-32b` costs ~$0.001 per section — negligible.
+
+```bash
+python -m app.ingest --tickers AAPL --since 2024-01-01 --summary-method llm
+```
+
+**3. No reranking — retrieval is purely cosine distance top-k. — Implemented in Phase 4**
+A query like "supply chain disruption risk" surfaces chunks sharing vocabulary but
+not necessarily the most relevant evidence. Precision drops as the corpus grows.
+
+`search_passages` uses hybrid search: dense vector (bge-small) + BM25 sparse
+(fastembed `SparseTextEmbedding`) fused with Reciprocal Rank Fusion. No new packages;
+fetches top-50 by dense distance, reranks by BM25, returns top-k.
+
+**4. ~~History truncation cuts at 3 turns~~ — Fixed (Phase 4).**
+Replaced with token-count truncation (20k-token budget for tool results). Financial
+analysis queries often chain across many turns; a fixed turn cutoff breaks multi-step
+reasoning. Oldest tool results are dropped first, replaced with a one-line placeholder.
+
+**5. ~~`search_passages` takes a single `company_id`~~ — Fixed (Phase 4).**
+Both `search_sections` and `search_passages` accept `company_ids: list[int]`
+(SQL: `WHERE d.company_id = ANY(:ids)`). Cross-company questions ("compare Apple and
+Microsoft's supply chain risk") resolve in a single tool call. The system prompt
+instructs Claude to use this rather than making separate per-company calls.

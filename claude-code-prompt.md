@@ -53,8 +53,9 @@ but document why in the README):
 
 - **Backend**: Python 3.12 + FastAPI
 - **Database**: Postgres 16 + pgvector extension
-- **Embeddings**: `fastembed` with `all-MiniLM-L6-v2` (384 dimensions, ONNX
-  backend — no torch required, ~100 MB install)
+- **Embeddings**: `fastembed` with `BAAI/bge-small-en-v1.5` (384 dimensions,
+  ONNX backend — no torch required, ~100 MB install; better domain coverage
+  than MiniLM for financial text)
 - **LLM for summaries**: Groq API, model `qwen/qwen3-32b` — used only during
   ingestion (Phase 3c), not in the chat path. Fast and cheap. Disable
   thinking mode (`reasoning_effort="none"`) for summary tasks.
@@ -173,7 +174,7 @@ tool at each level. Claude decides which level(s) to query.
 - **When Claude uses it**: "How is Apple positioned overall?" / "Compare
   Apple and Microsoft"
 - **Generation**: During ingestion, after section summaries exist.
-  Summarize the section summaries with Claude Haiku into one paragraph.
+  Summarize the section summaries with Groq qwen/qwen3-32b into one paragraph.
 - **Embedding**: Embed `"{company} {doc_type} {period}: {summary_text}"`
   (context-enriched). 384-dim vector.
 - **Size**: ~100 tokens per summary. 5 filings = ~500 tokens. Small enough
@@ -185,7 +186,8 @@ tool at each level. Claude decides which level(s) to query.
   answer cross-section comparison questions.
 - **Generation**: During ingestion. Start with extractive approach (first
   sentence of each major paragraph in the section). Upgrade to LLM-
-  generated summaries (Claude Haiku) later if retrieval quality is poor.
+  generated summaries (Groq qwen/qwen3-32b) via `--summary-method llm`
+  if retrieval quality is poor.
 - **Embedding**: Embed `"{company} {doc_type} {period} {section_title}:
   {summary_text}"`. Short texts embed worse — the prepended context helps.
 - **Size**: ~50-80 tokens each. 4-8 per filing.
@@ -682,14 +684,15 @@ table).
 ### Step 6 — Embed chunks (→ Level 3 stored)
 
 **What**: Generate a 384-dim vector for each chunk using
-`all-MiniLM-L6-v2`, then insert into `document_chunks`.
+`BAAI/bge-small-en-v1.5`, then insert into `document_chunks`.
 
 **Model loading**: Load the model once at pipeline startup. Keep it in
 memory across all documents. Do NOT reload per document.
 
 ```python
 from fastembed import TextEmbedding
-model = TextEmbedding("sentence-transformers/all-MiniLM-L6-v2")
+# BAAI/bge-small-en-v1.5: 384-dim, fastembed-native, better domain coverage than MiniLM.
+model = TextEmbedding("BAAI/bge-small-en-v1.5")
 ```
 
 Install fastembed via pip (poetry can't resolve it on Python 3.9):
@@ -777,7 +780,7 @@ quality is tested and you want better results.** Make this a config flag:
 **Embed the summary**: Same context-enrichment pattern:
 ```python
 embed_input = f"{company_name}, {doc_type}, {period_end}, {section_title}: {summary_text}"
-summary_vector = model.encode(embed_input)
+summary_vector = list(model.embed([embed_input]))[0].tolist()
 ```
 
 **Also create summaries for NON-CHUNKED sections**: Sections like ITEM 8
@@ -843,7 +846,7 @@ else:
 **Embed**:
 ```python
 embed_input = f"{company_name}, {doc_type}, {period_end}: {summary_text}"
-summary_vector = model.encode(embed_input)
+summary_vector = list(model.embed([embed_input]))[0].tolist()
 ```
 
 **Insert** into `document_summaries` with `key_themes` array.
@@ -992,20 +995,22 @@ doc_type, period_end, filed_at, key_themes.
 ### Tool 3: search_sections (Level 2)
 ```
 search_sections(
-    company_id: int,
+    company_ids: list[int],   # supports multi-company queries
     query: str,
     doc_types: list[str] | None = None,
     limit: int = 5
 ) -> list[SectionResult]
 ```
 Semantic search over section summaries. Returns: summary_text,
-section_title, document_id, doc_type, period_end, filed_at, distance.
+section_title, document_id, doc_type, period_end, filed_at, distance,
+company_ticker (include so Claude can attribute results to the right company).
 Claude uses this to decide WHICH sections to drill into.
+SQL filter: `WHERE d.company_id = ANY(:company_ids)`.
 
 ### Tool 4: search_passages (Level 3)
 ```
 search_passages(
-    company_id: int,
+    company_ids: list[int],   # supports multi-company queries
     query: str,
     section_titles: list[str] | None = None,  # narrow to specific sections
     doc_types: list[str] | None = None,
@@ -1013,11 +1018,38 @@ search_passages(
     distance_threshold: float = 0.5
 ) -> list[PassageResult]
 ```
-Semantic search over document chunks. If section_titles is provided, only
-searches within those sections (SQL WHERE clause before vector ordering).
-Returns: text, section_title, document_id, filed_at, period_end, distance.
-If best distance > threshold, return with a warning flag so Claude knows
-the evidence is weak.
+Semantic search over document chunks using **hybrid search** (dense vector +
+BM25 sparse, fused with Reciprocal Rank Fusion). This improves precision for
+financial keyword queries ("EBITDA", "covenant", "liquidity") that pure
+cosine-distance misses.
+
+Implementation in `tools.py`:
+```python
+from fastembed import TextEmbedding, SparseTextEmbedding
+
+_dense_model = TextEmbedding("BAAI/bge-small-en-v1.5")
+_sparse_model = SparseTextEmbedding("prithivida/Splade_PP_en_v1")
+
+def _hybrid_search(query: str, company_ids: list[int], ...) -> list[PassageResult]:
+    dense_vec = list(_dense_model.embed([query]))[0].tolist()
+    # BM25 sparse: run in Python over candidate set (pgvector doesn't support sparse natively)
+    # Strategy: fetch top-50 by dense distance, rerank by BM25 score, return top-k
+    rows = db.execute(
+        "SELECT *, embedding <=> :vec AS dist FROM document_chunks "
+        "JOIN documents d USING (document_id) "
+        "WHERE d.company_id = ANY(:ids) ORDER BY dist LIMIT 50",
+        {"vec": dense_vec, "ids": company_ids}
+    ).fetchall()
+    # BM25 rerank
+    sparse_scores = _bm25_score(query, [r.text for r in rows])
+    # RRF fusion: score = 1/(k + dense_rank) + 1/(k + sparse_rank), k=60
+    fused = _rrf(rows, sparse_scores)
+    return fused[:limit]
+```
+
+Returns: text, section_title, document_id, filed_at, period_end, distance,
+company_ticker. If best distance > threshold, return with a warning flag so
+Claude knows the evidence is weak.
 
 ### Tool 5: get_financial_line_items (Level 4)
 ```
@@ -1039,8 +1071,8 @@ period_end, period_type, document_id, filed_at.
 
 ### SDK and model
 - Use the Anthropic Python SDK
-- Chat model: `claude-sonnet-4-5-20241022` (or current Sonnet — check SDK)
-- Ingestion summary model: `claude-haiku-4-5-20241022`
+- Chat model: `claude-sonnet-4-6` (current Sonnet)
+- Ingestion summary model: Groq `qwen/qwen3-32b` (NOT Claude — already wired in summarizer.py)
 
 ### Tool-use loop
 Implement the standard tool_use loop:
@@ -1067,6 +1099,9 @@ RULES:
   right section, then search_passages to get the detail.
 - For exact numbers, use get_financial_line_items.
 - You can chain multiple tool calls to answer complex questions.
+- For cross-company questions ("compare Apple and Microsoft..."), call
+  search_sections or search_passages with both company_ids in a single call,
+  then synthesize the results. Do NOT make separate calls per company.
 
 AVAILABLE COMPANIES: {list_from_config}
 ```
@@ -1076,9 +1111,38 @@ Enable prompt caching on the system prompt and tool definitions. These
 don't change between turns, so they should be cached.
 
 ### Conversation history management
-Keep full tool results for the last 3 turns. For older turns, replace
-tool results with a brief summary to prevent context window bloat.
-Implement this as a simple history truncation function.
+Use **token-count truncation**, not turn-count. Financial analysis queries
+often chain across many turns ("What was revenue?" → "Compare to MSFT?" →
+"What drove the gap?"). A fixed 3-turn cutoff breaks multi-step reasoning.
+
+Target: keep the most recent turns whose combined tool result tokens fit
+within a 20k-token budget. Truncate from the oldest turn first, replacing
+dropped tool_result blocks with a one-line placeholder: `"[tool result
+truncated — {row_count} rows returned]"`.
+
+```python
+MAX_TOOL_RESULT_TOKENS = 20_000  # budget for all tool results in history
+
+def truncate_history(messages: list[dict]) -> list[dict]:
+    """Drop oldest tool results first until total tool-result tokens <= budget."""
+    # Rough token estimate: len(text) // 4
+    def token_count(msg: dict) -> int:
+        if msg["role"] == "tool":
+            return len(str(msg.get("content", ""))) // 4
+        return 0
+
+    total = sum(token_count(m) for m in messages)
+    result = list(messages)
+    i = 0
+    while total > MAX_TOOL_RESULT_TOKENS and i < len(result):
+        msg = result[i]
+        if msg["role"] == "tool":
+            t = token_count(msg)
+            result[i] = {**msg, "content": "[tool result truncated]"}
+            total -= t
+        i += 1
+    return result
+```
 
 ---
 
@@ -1126,7 +1190,7 @@ companies:
 ingestion:
   since: "2022-01-01"
   schedule_interval_hours: 1
-  embedding_model: "all-MiniLM-L6-v2"
+  embedding_model: "BAAI/bge-small-en-v1.5"
 
 chunking:
   target_tokens: 800
@@ -1235,7 +1299,7 @@ checkpoint below).
 - `chunker.py` — implement chunk_section() with paragraph-boundary-aware
   splitting, sentence fallback, overlap, and table chunk handling exactly
   as specified
-- `embedder.py` — load MiniLM-L6-v2 once, implement context-enriched
+- `embedder.py` — load BAAI/bge-small-en-v1.5 once, implement context-enriched
   embedding input (company + doc_type + section_title prefix), batch encode
 - Store chunks in document_chunks with both `text` (clean) and
   `embedding_input` (enriched) columns
@@ -1254,8 +1318,8 @@ checkpoint below).
 
 ### Phase 3c — Ingestion: Summaries (Steps 7-8)
 - `summarizer.py` — implement extractive_summary() for section summaries
-  (Phase 1 approach). Implement LLM-generated document summary using Claude
-  Haiku (with key_themes extraction)
+  (Phase 1 approach). Implement LLM-generated document summary using Groq
+  qwen/qwen3-32b (with key_themes extraction)
 - Generate section summaries for ALL sections (including non-chunked ones)
 - Generate document summary from section summaries
 - Embed all summaries with context-enriched input
@@ -1283,7 +1347,7 @@ filings but skip Level 4 (no XBRL data in PDFs).
 
 | Level | Table | Behaviour |
 |-------|-------|-----------|
-| 1 | `document_summaries` | ✅ Claude Haiku summarizes whole doc |
+| 1 | `document_summaries` | ✅ Groq qwen/qwen3-32b summarizes whole doc |
 | 2 | `section_summaries` | ✅ Best-effort — headings detected by font size |
 | 3 | `document_chunks` | ✅ Full text chunked + embedded |
 | 4 | `financial_line_items` | ❌ Skipped — no XBRL |
@@ -1552,19 +1616,25 @@ FROM document_summaries LIMIT 3;
 ### Phase 4 — Tools + Claude loop (CLI chat)
 - Implement all 5 tools with Pydantic input/output models
 - Each tool connects to DB via readonly user
-- search_passages supports section_titles filter (WHERE clause before
-  vector ordering) and distance_threshold
+- `search_sections` and `search_passages` accept `company_ids: list[int]`
+  (SQL: `WHERE d.company_id = ANY(:ids)`) — enables single-call cross-company queries
+- `search_passages` uses hybrid search: dense (BAAI/bge-small-en-v1.5) + BM25
+  sparse rerank via fastembed `SparseTextEmbedding`, fused with RRF
+- `search_passages` supports section_titles filter and distance_threshold
 - Tool-use loop with retry and backoff on Anthropic API calls
-- System prompt with the multi-level retrieval guidance as specified
+- Token-count history truncation (budget: 20k tokens of tool results)
+- System prompt with multi-level retrieval guidance + cross-company instruction
 - CLI chat: `python -m app.chat`
-- Test with these three queries (they exercise different levels):
+- Test with these four queries (they exercise different levels + multi-company):
   1. "What was Apple's revenue last year?" → should call
      get_financial_line_items (Level 4)
   2. "What supply chain risks did Apple mention?" → should call
      search_sections (Level 2) then search_passages (Level 3)
   3. "Give me an overview of Apple's financial health" → should call
      get_document_overview (Level 1)
-- Verify: all three queries return reasonable answers with citations.
+  4. "Compare Apple and Microsoft's supply chain risks" → should call
+     search_sections or search_passages with both company_ids in one call
+- Verify: all four queries return reasonable answers with citations.
   Show me the tool call sequence for each query.
 
 **Stop. Tell me what to verify and what's next.**
@@ -1589,8 +1659,8 @@ FROM document_summaries LIMIT 3;
 ### Phase 6 — Polish
 - Tool call logging: log every call with tool_name, inputs, output
   row count, latency_ms (use structured JSON logging)
-- Conversation history management: keep full tool results for last 3 turns,
-  summarize older ones
+- Conversation history management: token-count truncation already implemented
+  in Phase 4 — verify the 20k-token budget holds under a long multi-turn session
 - Data status endpoint: `GET /api/status` → last ingestion time per company,
   document count, chunk count
 - README.md with architecture, setup, usage
@@ -1620,7 +1690,7 @@ FROM document_summaries LIMIT 3;
 - EDGAR requires a real email in User-Agent. Without it you get 403.
 - EDGAR rate limit is 10 req/sec. Respect it or get blocked.
 - The companyfacts JSON can be large (10MB+). Parse incrementally.
-- MiniLM-L6-v2 outputs 384 dimensions, NOT 1536. The schema must match.
+- BAAI/bge-small-en-v1.5 outputs 384 dimensions, NOT 1536. The schema must match.
 - pgvector ivfflat index needs `lists` ≥ sqrt(row_count). For small
   datasets (<1000 rows) you can skip the index entirely — brute force
   is fast enough.

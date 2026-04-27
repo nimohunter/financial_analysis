@@ -1,4 +1,4 @@
-"""Embed chunks with all-MiniLM-L6-v2 (via fastembed) and write to document_chunks."""
+"""Embed chunks with BAAI/bge-small-en-v1.5 (via fastembed) and write to document_chunks."""
 from __future__ import annotations
 
 import logging
@@ -11,7 +11,9 @@ from app.models import Document, DocumentChunk
 logger = logging.getLogger(__name__)
 
 _model = None
-_MODEL_NAME = "sentence-transformers/all-MiniLM-L6-v2"
+# bge-small-en-v1.5: 384-dim, same as MiniLM but trained on broader/domain-diverse corpora.
+# Supported by fastembed; zero schema changes vs MiniLM.
+_MODEL_NAME = "BAAI/bge-small-en-v1.5"
 
 
 def _get_model():
