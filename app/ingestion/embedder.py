@@ -67,3 +67,8 @@ def embed_and_store(
     session.flush()
     logger.info("Inserted %d chunks for document %d", len(rows), doc.document_id)
     return len(rows)
+
+
+def embed_text(text: str) -> list[float]:
+    """Embed a single string. Reuses the singleton model."""
+    return list(_get_model().embed([text]))[0].tolist()

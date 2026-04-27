@@ -44,7 +44,7 @@ async def run_ingest(tickers: list[str], since: date, summary_method: str) -> No
                 logger.error("Ticker %s not in config.yaml — skipping", ticker)
                 continue
 
-            result = await pipeline.ingest_company(company, since, session)
+            result = await pipeline.ingest_company(company, since, session, summary_method)
 
             if result.errors:
                 for err in result.errors:
