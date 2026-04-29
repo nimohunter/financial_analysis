@@ -24,13 +24,14 @@ Three isolated subsystems:
 | Database | — | — | Postgres 16 + pgvector |
 | Chat backend | Anthropic API only | Read-only (`readonly` user) | `app/chat/` |
 
-### Four-level retrieval hierarchy
+### Five-level retrieval hierarchy
 
-Claude has five tools, each querying a different level of detail:
+Claude has six tools, each querying a different level of detail:
 
 | Level | Table | Used for |
 |-------|-------|----------|
-| 1 | `document_summaries` | "Give me an overview of Apple" |
+| 0 | `company_wiki` | "What's the full Apple story?" (cross-filing synthesis) |
+| 1 | `document_summaries` | "What does Apple's latest 10-K say?" |
 | 2 | `section_summaries` | Navigate to the right section |
 | 3 | `document_chunks` | Find specific evidence (vector search) |
 | 4 | `financial_line_items` | Exact figures — "What was revenue in Q3 2024?" |
@@ -193,12 +194,13 @@ app/
     chunker.py          # Sections → overlapping chunks
     embedder.py         # Text → 384-dim vectors (fastembed)
     summarizer.py       # Section + document summaries (Groq)
+    wiki.py             # Company wiki synthesis (Karpathy LLM Wiki pattern)
     parser_pdf.py       # PDF → sections (uploads)
     fetcher_upload.py   # Save uploaded files
     pipeline.py         # Orchestrator
     cli.py              # CLI entry point
   chat/
-    tools.py            # 5 DB query tools
+    tools.py            # 6 DB query tools
     agent.py            # Claude tool-use loop
     router.py           # FastAPI SSE endpoint
   migrations/           # Alembic
@@ -225,7 +227,9 @@ config.yaml             # Companies + ingestion settings
 
 ### Strengths
 
-- **Four-level retrieval hierarchy** keeps exact financial numbers (XBRL/SQL) separate from narrative passages (vectors). Most RAG systems flatten everything into one vector store; financial Q&A fails when Claude has to parse tables in chunks instead of querying structured data.
+- **Five-level retrieval hierarchy** keeps exact financial numbers (XBRL/SQL) separate from narrative passages (vectors). Most RAG systems flatten everything into one vector store; financial Q&A fails when Claude has to parse tables in chunks instead of querying structured data.
+
+- **LLM Wiki pattern (L0)** — inspired by Karpathy's LLM Wiki. Instead of re-synthesizing a company's overall story on every query, `wiki.py` computes a persistent cross-filing page at ingest time. Broad questions ("What's Apple's strategy?") are answered from the pre-built synthesis rather than assembling it from scratch each time. The wiki compounds: each new filing run refreshes the page with the latest data.
 - **Context-enriched embeddings** — every chunk and summary is embedded as `"{company}, {doc_type}, {section_title}: {text}"` rather than raw text. Short texts embed poorly; prepending document context is a known fix that improves retrieval precision.
 - **Extractive summaries by default, LLM upgrade path** — the `--summary-method llm` flag lets you upgrade section summary quality without changing the schema. Free on the first pass, better on the second.
 - **Prompt caching on system prompt + tool definitions** — these tokens are constant across every chat turn. Caching them cuts per-turn cost and latency noticeably on Claude Sonnet.

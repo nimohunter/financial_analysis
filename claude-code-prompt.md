@@ -150,6 +150,16 @@ document_summaries (
     key_themes       TEXT[]                  -- ['supply_chain', 'competition', ...]
 );
 
+-- LEVEL 0: Company wiki — LLM-maintained cross-filing synthesis (Karpathy LLM Wiki pattern)
+company_wiki (
+    wiki_id          SERIAL PRIMARY KEY,
+    company_id       INT REFERENCES companies(company_id) UNIQUE,
+    wiki_text        TEXT NOT NULL,          -- synthesized from all indexed doc summaries
+    wiki_embedding   vector(384) NOT NULL,
+    last_updated_at  TIMESTAMPTZ DEFAULT now(),
+    source_doc_ids   INT[]                   -- document_ids used in this version
+);
+
 -- Indexes
 CREATE INDEX ON document_chunks USING ivfflat (embedding vector_cosine_ops)
     WITH (lists = 100);
@@ -157,22 +167,42 @@ CREATE INDEX ON section_summaries USING ivfflat (summary_embedding vector_cosine
     WITH (lists = 50);
 CREATE INDEX ON document_summaries USING ivfflat (summary_embedding vector_cosine_ops)
     WITH (lists = 20);
+CREATE INDEX ON company_wiki USING ivfflat (wiki_embedding vector_cosine_ops)
+    WITH (lists = 10);
 CREATE INDEX ON financial_line_items (company_id, statement_type, period_end);
 CREATE INDEX ON document_chunks (document_id, section_title);
 ```
 
 ---
 
-## Four-level retrieval hierarchy
+## Five-level retrieval hierarchy
 
 This is the core design. Different questions need different levels of
-detail. The system stores data at four abstraction levels and exposes a
+detail. The system stores data at five abstraction levels and exposes a
 tool at each level. Claude decides which level(s) to query.
 
-### Level 1 — Document summaries (broadest)
+### Level 0 — Company wiki (broadest: cross-filing synthesis)
+- **What it stores**: One LLM-maintained page per company. Synthesized
+  from all document summaries — business model, financial trends, key risks,
+  strategic themes across all indexed filings.
+- **When Claude uses it**: For the very broadest questions — "What's
+  Apple's overall story?" / "How has Apple's strategy evolved?" / "Compare
+  Apple and Microsoft's market positions." Use this *before* drilling into
+  per-filing detail.
+- **Generation**: Inspired by Karpathy's LLM Wiki pattern — the wiki is a
+  *persistent, compounding artifact* synthesized at ingest time, not
+  re-derived on every query. Called at the end of `ingest_company()` after
+  all filings for a company are indexed. Groq synthesizes from all document
+  summaries (up to 8 most recent). Previous version is replaced (delete +
+  insert).
+- **Embedding**: Embed `"{company}: {wiki_text[:500]}"`.
+- **Size**: ~500 tokens. One row per company.
+
+### Level 1 — Document summaries (per-filing overview)
 - **What it stores**: 1 paragraph per filing. Key themes, overall picture.
-- **When Claude uses it**: "How is Apple positioned overall?" / "Compare
-  Apple and Microsoft"
+- **When Claude uses it**: "What does Apple's most recent 10-K say?" /
+  "Show me the last 3 filings for Apple." When the question targets a
+  specific filing rather than the company's overall story.
 - **Generation**: During ingestion, after section summaries exist.
   Summarize the section summaries with Groq qwen/qwen3-32b into one paragraph.
 - **Embedding**: Embed `"{company} {doc_type} {period}: {summary_text}"`
@@ -240,6 +270,7 @@ app/ingestion/
     chunker.py          # Step 5: sections → chunks
     embedder.py         # Step 6: text → vectors
     summarizer.py       # Step 7: generate section + doc summaries
+    wiki.py             # Step 10: company wiki synthesis (Karpathy LLM Wiki pattern)
     parser_pdf.py       # PDF text extraction + heading detection (uploads)
     fetcher_upload.py   # Save uploaded file, dedup, insert documents row
     pipeline.py         # Orchestrator: runs steps in order per company
@@ -867,6 +898,102 @@ This is the signal that the document is fully ingested and queryable.
 
 ---
 
+### Step 10 — Update company wiki (→ Level 0)
+
+**What**: After all documents for a company finish indexing in a run,
+synthesize a cross-filing company wiki page using Groq. One page per
+company; replaces the previous version on every ingest run.
+
+**Inspiration**: Karpathy's LLM Wiki pattern. Instead of re-deriving the
+company overview on every chat query, synthesize it once at ingest time
+and store it. The wiki *compounds*: each new filing run adds to the synthesis.
+
+**When to run**: Called once per `ingest_company()` run, after all
+per-document steps complete — even if no new filings were fetched.
+
+**Implementation** (`wiki.py`):
+```python
+import os
+import logging
+from sqlalchemy.orm import Session
+from app.models import Company, CompanyWiki, DocumentSummary, Document
+
+logger = logging.getLogger(__name__)
+
+
+def update_company_wiki(company: Company, session: Session) -> None:
+    """Synthesize a cross-filing wiki page from all indexed doc summaries."""
+    rows = (
+        session.query(DocumentSummary, Document)
+        .join(Document, DocumentSummary.document_id == Document.document_id)
+        .filter(Document.company_id == company.company_id)
+        .order_by(Document.period_end.desc())
+        .limit(8)
+        .all()
+    )
+    if not rows:
+        logger.info("%s: no doc summaries — skipping wiki update", company.ticker)
+        return
+
+    doc_ids = [d.document_id for _, d in rows]
+    summary_lines = "\n".join(
+        f"- {d.doc_type} ({d.period_end}): {ds.summary_text}"
+        for ds, d in rows
+    )
+
+    if not os.environ.get("GROQ_API_KEY"):
+        wiki_text = summary_lines  # fallback: concatenate summaries
+    else:
+        from groq import Groq
+        client = Groq(api_key=os.environ["GROQ_API_KEY"])
+        resp = client.chat.completions.create(
+            model="qwen/qwen3-32b",
+            max_tokens=600,
+            reasoning_effort="none",
+            messages=[{
+                "role": "user",
+                "content": (
+                    f"You are maintaining a financial wiki page for "
+                    f"{company.name} ({company.ticker}).\n\n"
+                    f"Summaries of all indexed SEC filings (most recent first):\n\n"
+                    f"{summary_lines}\n\n"
+                    f"Write a comprehensive wiki page (4-6 sentences) covering:\n"
+                    f"- Business overview and revenue model\n"
+                    f"- Financial trends across these filings (growth, margins, cash)\n"
+                    f"- Key recurring risks and strategic themes\n"
+                    f"- Notable changes or inflection points\n\n"
+                    f"Be specific: include numbers, dates, and trends."
+                ),
+            }],
+        )
+        wiki_text = resp.choices[0].message.content.strip()
+
+    from app.ingestion.embedder import embed_text
+    vec = embed_text(f"{company.name}: {wiki_text[:500]}")
+
+    session.query(CompanyWiki).filter_by(company_id=company.company_id).delete()
+    session.add(CompanyWiki(
+        company_id=company.company_id,
+        wiki_text=wiki_text,
+        wiki_embedding=vec,
+        source_doc_ids=doc_ids,
+    ))
+    session.commit()
+    logger.info("%s: company wiki updated (%d source docs)", company.ticker, len(doc_ids))
+```
+
+**Add to `pipeline.py`**: Call `wiki.update_company_wiki()` at the end of
+`ingest_company()`, after all filings are processed:
+```python
+try:
+    wiki.update_company_wiki(company, session)
+except Exception as exc:
+    logger.exception("Wiki update failed for %s", company.ticker)
+    result.errors.append(f"wiki: {exc}")
+```
+
+---
+
 ### Pipeline orchestrator (pipeline.py)
 
 The orchestrator runs all steps in order for one company:
@@ -972,6 +1099,15 @@ for new filing notifications — but that's out of scope here.
 Five tools, each as a narrow function with a JSON schema. Every tool
 returns citation metadata (document_id, filed_at, period_end at minimum).
 Cap all result sizes. Log every tool call (inputs, outputs, latency).
+
+### Tool 0: get_company_wiki (Level 0)
+```
+get_company_wiki(company_id: int) -> CompanyWikiResult
+```
+Returns the LLM-maintained wiki page for a company. Contains cross-filing
+synthesis: business model, financial trends, key risks, strategic themes.
+Use for the broadest overview questions before drilling into per-filing
+detail. Returns: wiki_text, last_updated_at, source_doc_count.
 
 ### Tool 1: search_companies
 ```
@@ -1094,7 +1230,9 @@ RULES:
   figures you haven't looked up.
 - Always cite the source: include the filing type, period, and date.
 - If the data isn't available in your tools, say so clearly.
-- For broad/overview questions, start with get_document_overview.
+- For the broadest questions about a company's overall story or multi-year
+  trends, start with get_company_wiki (Level 0).
+- For filing-specific overviews, use get_document_overview (Level 1).
 - For topic-specific questions, use search_sections first to find the
   right section, then search_passages to get the detail.
 - For exact numbers, use get_financial_line_items.
@@ -1316,7 +1454,7 @@ checkpoint below).
 
 **Stop. Tell me what to verify and what's next.**
 
-### Phase 3c — Ingestion: Summaries (Steps 7-8)
+### Phase 3c — Ingestion: Summaries (Steps 7-8) + Company wiki (Step 10)
 - `summarizer.py` — implement extractive_summary() for section summaries
   (Phase 1 approach). Implement LLM-generated document summary using Groq
   qwen/qwen3-32b (with key_themes extraction)
@@ -1326,11 +1464,15 @@ checkpoint below).
 - Update document status to 'indexed'
 - Config flag `summary_method: "extractive"` for sections (default),
   `"llm"` as upgrade option
+- `wiki.py` — implement `update_company_wiki()` as specified in Step 10.
+  Add `CompanyWiki` SQLAlchemy model. Call from `ingest_company()` after
+  all filings are processed.
 - Verify: run full pipeline for AAPL. Show me:
   1. All section summaries for the most recent 10-K (title + summary_text)
   2. The document summary for that 10-K
   3. The key_themes array
   4. Document status is 'indexed'
+  5. Company wiki: `SELECT LEFT(wiki_text, 300), last_updated_at FROM company_wiki;`
 
 **Stop. Tell me what to verify and what's next.**
 
@@ -1567,7 +1709,8 @@ SELECT
   (SELECT COUNT(*) FROM financial_line_items)   AS line_items,
   (SELECT COUNT(*) FROM document_chunks)        AS chunks,
   (SELECT COUNT(*) FROM section_summaries)      AS section_summaries,
-  (SELECT COUNT(*) FROM document_summaries)     AS doc_summaries;
+  (SELECT COUNT(*) FROM document_summaries)     AS doc_summaries,
+  (SELECT COUNT(*) FROM company_wiki)           AS company_wikis;
 
 -- 2. All documents are fully indexed (none stuck mid-pipeline)
 SELECT status, COUNT(*) FROM documents GROUP BY status;
@@ -1604,6 +1747,7 @@ FROM document_summaries LIMIT 3;
 
 **Gate criteria — all must be true before Milestone B starts:**
 - [ ] `chunks` > 0 and `doc_summaries` > 0
+- [ ] `company_wikis` > 0 (one per company ingested)
 - [ ] No documents with status other than 'indexed'
 - [ ] `embedding_dims` = 384
 - [ ] Vector search returns rows without error
@@ -1625,16 +1769,18 @@ FROM document_summaries LIMIT 3;
 - Token-count history truncation (budget: 20k tokens of tool results)
 - System prompt with multi-level retrieval guidance + cross-company instruction
 - CLI chat: `python -m app.chat`
-- Test with these four queries (they exercise different levels + multi-company):
-  1. "What was Apple's revenue last year?" → should call
+- Test with these five queries (they exercise all levels + multi-company):
+  1. "Tell me about Apple as a company" → should call
+     get_company_wiki (Level 0)
+  2. "What was Apple's revenue last year?" → should call
      get_financial_line_items (Level 4)
-  2. "What supply chain risks did Apple mention?" → should call
+  3. "What supply chain risks did Apple mention?" → should call
      search_sections (Level 2) then search_passages (Level 3)
-  3. "Give me an overview of Apple's financial health" → should call
+  4. "Give me an overview of Apple's most recent 10-K" → should call
      get_document_overview (Level 1)
-  4. "Compare Apple and Microsoft's supply chain risks" → should call
+  5. "Compare Apple and Microsoft's supply chain risks" → should call
      search_sections or search_passages with both company_ids in one call
-- Verify: all four queries return reasonable answers with citations.
+- Verify: all five queries return reasonable answers with citations.
   Show me the tool call sequence for each query.
 
 **Stop. Tell me what to verify and what's next.**
